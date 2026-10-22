@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -39,6 +40,7 @@ class _SourcesScreenState extends State<SourcesScreen> {
   final _pending = <String>{};
   final _revisions = <String, int>{};
   final _expandedHealth = <String>{};
+  final _expandedErrors = <String>{};
   Timer? _timer;
   bool _polling = false;
   int _ticks = 0;
@@ -72,7 +74,7 @@ class _SourcesScreenState extends State<SourcesScreen> {
     final epoch = widget.store.profileEpoch;
     try {
       await Future.wait([
-        for (final source in widget.store.sources)
+        for (final source in widget.store.managedSources)
           (() async {
             final revision = _revisions[source.id] ?? 0;
             try {
@@ -131,6 +133,17 @@ class _SourcesScreenState extends State<SourcesScreen> {
     }
   }
 
+  Future<void> _toggleHidden(SourceSite source) async {
+    final hide = !widget.store.isSourceHidden(source.id);
+    try {
+      await widget.store.setSourceHidden(source.id, hidden: hide);
+    } catch (error) {
+      if (mounted) {
+        setState(() => _errors[source.id] = error.toString());
+      }
+    }
+  }
+
   Future<void> _copy(SourceSite source, SourceStatus status) async {
     final text = StringBuffer('${source.name}\n');
     text.writeln(
@@ -162,7 +175,7 @@ class _SourcesScreenState extends State<SourcesScreen> {
   Widget build(BuildContext context) => AnimatedBuilder(
     animation: widget.store,
     builder: (context, _) {
-      final sources = widget.store.sources.toList()
+      final sources = widget.store.managedSources.toList()
         ..sort((a, b) {
           final aFirst = a.id == widget.initialSource ? 0 : 1;
           final bFirst = b.id == widget.initialSource ? 0 : 1;
@@ -186,7 +199,8 @@ class _SourcesScreenState extends State<SourcesScreen> {
                   const Padding(
                     padding: EdgeInsets.only(bottom: 16),
                     child: Text(
-                      '各站源可分别更新和检测。更新会查找新剧、继续加载一页历史内容，并分批补齐资料；离开此页后任务继续。',
+                      '各站源可分别更新和检测。更新会查找新剧、继续加载一页历史内容，并分批补齐资料；离开此页后任务继续。'
+                      '隐藏站源后，首页切换列表、全部站源与搜索都不会再出现该站源的内容，随时可以在此页恢复显示。',
                     ),
                   ),
                   if (sources.isEmpty)
@@ -228,6 +242,7 @@ class _SourcesScreenState extends State<SourcesScreen> {
 
   Widget _sourceCard(SourceSite source) {
     final status = _statuses[source.id];
+    final hidden = widget.store.isSourceHidden(source.id);
     final pending = _pending.contains(source.id);
     final busy = pending || status?.running == true;
     final seconds = status?.retrySeconds ?? 0;
@@ -247,7 +262,9 @@ class _SourcesScreenState extends State<SourcesScreen> {
           children: [
             Row(
               children: [
-                const Icon(Icons.dns_outlined),
+                Icon(
+                  hidden ? Icons.visibility_off_outlined : Icons.dns_outlined,
+                ),
                 const SizedBox(width: 12),
                 Expanded(
                   child: Text(
@@ -255,7 +272,22 @@ class _SourcesScreenState extends State<SourcesScreen> {
                     style: Theme.of(context).textTheme.titleLarge,
                   ),
                 ),
+                if (hidden)
+                  Padding(
+                    padding: const EdgeInsets.only(right: 8),
+                    child: Text('已隐藏', style: TextStyle(color: colors.outline)),
+                  ),
                 Text('${status?.count ?? 0} 部'),
+                IconButton(
+                  key: ValueKey('hide-${source.id}'),
+                  tooltip: hidden ? '在首页显示此站源' : '隐藏此站源',
+                  onPressed: () => _toggleHidden(source),
+                  icon: Icon(
+                    hidden
+                        ? Icons.visibility_outlined
+                        : Icons.visibility_off_outlined,
+                  ),
+                ),
               ],
             ),
             const SizedBox(height: 8),
@@ -280,7 +312,7 @@ class _SourcesScreenState extends State<SourcesScreen> {
                   key: ValueKey('check-${source.id}'),
                   onPressed: enabled ? () => _run(source, 'check') : null,
                   icon: const Icon(Icons.network_check),
-                  label: const Text('检测连接与播放'),
+                  label: const Text('检测'),
                 ),
                 if (status?.running == true)
                   TextButton(
@@ -337,14 +369,7 @@ class _SourcesScreenState extends State<SourcesScreen> {
                   style: TextStyle(color: colors.error),
                 ),
               ),
-            if (error.isNotEmpty)
-              Padding(
-                padding: const EdgeInsets.only(top: 8),
-                child: SelectableText(
-                  error,
-                  style: TextStyle(color: colors.error),
-                ),
-              ),
+            if (error.isNotEmpty) _errorBlock(source.id, error),
             if (status != null && status.storageError.isNotEmpty)
               Padding(
                 padding: const EdgeInsets.only(top: 8),
@@ -469,6 +494,60 @@ class _SourcesScreenState extends State<SourcesScreen> {
           ],
         ),
       ),
+    );
+  }
+
+  Widget _errorBlock(String sourceId, String error) {
+    final colors = Theme.of(context).colorScheme;
+    final expanded = _expandedErrors.contains(sourceId);
+    final style = TextStyle(color: colors.error);
+    final toggle = Align(
+      alignment: Alignment.centerLeft,
+      child: TextButton(
+        key: ValueKey('error-toggle-$sourceId'),
+        style: TextButton.styleFrom(
+          foregroundColor: colors.error,
+          padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 4),
+          visualDensity: VisualDensity.compact,
+        ),
+        onPressed: () => setState(() {
+          if (expanded) {
+            _expandedErrors.remove(sourceId);
+          } else {
+            _expandedErrors.add(sourceId);
+          }
+        }),
+        child: Text(expanded ? '收起' : '展开'),
+      ),
+    );
+    final lines = const LineSplitter().convert(error.trim());
+    final summary = lines.length > 1
+        ? '${lines.first} 等 ${lines.length} 项'
+        : lines.first;
+    return Padding(
+      padding: const EdgeInsets.only(top: 8),
+      child: expanded
+          ? Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                ConstrainedBox(
+                  constraints: const BoxConstraints(maxHeight: 160),
+                  child: SingleChildScrollView(
+                    child: SelectableText(error, style: style),
+                  ),
+                ),
+                toggle,
+              ],
+            )
+          : Row(
+              crossAxisAlignment: CrossAxisAlignment.center,
+              children: [
+                Expanded(
+                  child: SelectableText(summary, maxLines: 2, style: style),
+                ),
+                toggle,
+              ],
+            ),
     );
   }
 }

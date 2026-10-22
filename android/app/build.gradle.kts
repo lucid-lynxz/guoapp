@@ -58,6 +58,7 @@ android {
         }
         release {
             signingConfig = signingConfigs.getByName(if (releaseKey.exists()) "release" else "debug")
+            proguardFiles("proguard-rules.pro")
         }
     }
 

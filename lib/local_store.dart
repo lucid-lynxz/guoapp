@@ -49,6 +49,7 @@ class LocalStore extends ChangeNotifier {
   bool _gateOff = false;
   String _gateSalt = '';
   String _gateHash = '';
+  Set<String> _hiddenSources = {};
   DateTime _retryAfter = DateTime(2000);
 
   void _initialize() {
@@ -136,7 +137,55 @@ class LocalStore extends ChangeNotifier {
       !locked &&
       SourceSite.isAvailable(source) &&
       profile.allows(source) &&
+      (_gateOff || _sourcesUnlocked || SourceSite.isPrimary(source)) &&
+      !_hiddenSources.contains(source);
+
+  /// 用户手动隐藏的站源，隐藏后不参与首页下拉、全部站源与搜索。
+  bool isSourceHidden(String source) => _hiddenSources.contains(source);
+  Set<String> get hiddenSources => Set.unmodifiable(_hiddenSources);
+
+  /// 站源管理页使用：包含被隐藏的站源，便于恢复显示。
+  List<SourceSite> get managedSources => SourceSite.visibleValues(
+    unlocked: _gateOff || _sourcesUnlocked,
+  ).where((site) => allowedWithoutHidden(site.id)).toList();
+
+  bool allowedWithoutHidden(String source) =>
+      !locked &&
+      SourceSite.isAvailable(source) &&
+      profile.allows(source) &&
       (_gateOff || _sourcesUnlocked || SourceSite.isPrimary(source));
+
+  Set<String> _readHiddenSources() {
+    if (_configurationError != null) return {};
+    try {
+      return (jsonDecode(_string(_key('hiddenSources')) ?? '[]') as List)
+          .whereType<String>()
+          .where(SourceSite.isKnown)
+          .toSet();
+    } catch (_) {
+      return {};
+    }
+  }
+
+  Future<void> setSourceHidden(String source, {required bool hidden}) {
+    if (!allowedWithoutHidden(source)) {
+      return Future.error(StateError('当前用户没有此站源权限'));
+    }
+    final epoch = _epoch;
+    return _queue(() async {
+      if (epoch != _epoch) throw StateError('当前用户已变更，请重试');
+      final entries = Set<String>.from(_hiddenSources);
+      if (hidden) {
+        entries.add(source);
+      } else {
+        entries.remove(source);
+      }
+      await _commit({_key('hiddenSources'): jsonEncode(entries.toList())});
+      _hiddenSources = entries;
+      _notify();
+    });
+  }
+
   List<SourceSite> get sources => SourceSite.visibleValues(
     unlocked: _gateOff || _sourcesUnlocked,
   ).where((site) => allowsSource(site.id)).toList();
@@ -253,6 +302,7 @@ class LocalStore extends ChangeNotifier {
     _favorites.clear();
     _followStates.clear();
     _seriesCandidates.clear();
+    _hiddenSources = _readHiddenSources();
     if (_configurationError != null) return;
     for (final row in readJsonList(_string(_key('history')))) {
       try {
@@ -1019,6 +1069,9 @@ class LocalStore extends ChangeNotifier {
             'recentSearches': jsonDecode(
               _string(_key('recentSearches', profile.id)) ?? '[]',
             ),
+            'hiddenSources': jsonDecode(
+              _string(_key('hiddenSources', profile.id)) ?? '[]',
+            ),
           },
       },
     });
@@ -1098,6 +1151,13 @@ class LocalStore extends ChangeNotifier {
           )) {
         throw const FormatException('备份搜索记录无效');
       }
+      final hidden = library['hiddenSources'] as List? ?? [];
+      if (hidden.length > SourceSite.knownValues.length ||
+          hidden.any(
+            (value) => value is! String || !SourceSite.isKnown(value),
+          )) {
+        throw const FormatException('备份隐藏站源设置无效');
+      }
     }
     return data;
   }
@@ -1151,6 +1211,9 @@ class LocalStore extends ChangeNotifier {
         ),
         _key('recentSearches', profile.id): jsonEncode(
           library['recentSearches'] ?? [],
+        ),
+        _key('hiddenSources', profile.id): jsonEncode(
+          library['hiddenSources'] ?? [],
         ),
       });
     }
